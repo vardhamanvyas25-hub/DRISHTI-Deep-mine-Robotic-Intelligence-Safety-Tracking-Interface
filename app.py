@@ -1,171 +1,213 @@
 import os
+import sys
 import time
-import cv2
-import numpy as np
-from flask import Flask, jsonify, request, send_from_directory, Response
+import threading
+from flask import Flask, render_template, Response, jsonify, request
+from flask_socketio import SocketIO, emit
 
-os.environ["OPENCV_LOG_LEVEL"] = "FATAL"
+# Ensure local imports find files in current directory
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 
-app = Flask(__name__, static_folder="static")
+from motor_control import MotorController
+from telemetry_reader import TelemetryReader, get_available_ports
+from camera_streamer import CameraStreamer
 
-# Video Stream Configuration
-RASPBERRY_PI_IP = "127.0.0.1"
-WEBCAM_STREAM_URL = f"http://{RASPBERRY_PI_IP}:8000/webcam.mjpg"
-THERMAL_STREAM_URL = f"http://{RASPBERRY_PI_IP}:8000/thermal.mjpg"
+app = Flask(__name__, template_folder=os.path.join(BASE_DIR, 'templates'),
+                      static_folder=os.path.join(BASE_DIR, 'static'))
+app.config['SECRET_KEY'] = 'drishti_rover_command_secret'
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-latest_yolo_detections = []
-pending_rover_command = None
+# Initialize System Modules
+print("[SYSTEM] Starting DRISHTI Command & Control Engine...")
+motor = MotorController()
+telemetry = TelemetryReader()
+telemetry.start()
+cameras = CameraStreamer()
 
-latest_telemetry = {
-    "methane": 0,
-    "co": 0,
-    "temp": 24.5,
-    "humidity": 48,
-    "pressure": 1013.2,
-    "voltage": 12.1,
-    "battery": 95,
-    "noise": 38
-}
+def calculate_hazard_assessment(t_data, detections, thermal_stats):
+    """Computes real-time multi-sensor composite hazard rating (0-100)."""
+    mq4 = t_data.get("mq4_raw", 0)
+    mq7 = t_data.get("mq7_raw", 0)
+    max_temp = thermal_stats.get("max_temp", 26.0)
 
-# Initialize YOLOv8 Model
-yolo_model = None
-try:
-    from ultralytics import YOLO
-    yolo_model = YOLO("yolov8n.pt")
-    print("[INFO] YOLOv8 Model loaded successfully!")
-except Exception as e:
-    print(f"[WARNING] Could not initialize Ultralytics YOLO: {e}")
+    score = 8
+    # Methane Risk
+    if mq4 > 1800:
+        score += 38
+    elif mq4 > 1100:
+        score += 20
+    elif mq4 > 700:
+        score += 8
 
-# Frame Generator for Optical Stream + Target Detection
-def generate_optical_stream():
-    global latest_yolo_detections
-    
-    # Force OpenCV to use the FFMPEG backend for network streams
-    cap = cv2.VideoCapture(WEBCAM_STREAM_URL, cv2.CAP_FFMPEG)
+    # Carbon Monoxide Risk
+    if mq7 > 1500:
+        score += 35
+    elif mq7 > 900:
+        score += 18
+    elif mq7 > 500:
+        score += 8
 
-    while True:
-        success, frame = cap.read()
-        if success and frame is not None:
-            if yolo_model is not None:
-                try:
-                    results = yolo_model(frame, conf=0.35, verbose=False)[0]
-                    annotated_frame = results.plot()
+    # Thermal Hotspot Risk
+    if max_temp > 50.0:
+        score += 28
+    elif max_temp > 40.0:
+        score += 15
+    elif max_temp > 33.0:
+        score += 6
 
-                    detections = []
-                    for box in results.boxes:
-                        cls_id = int(box.cls[0])
-                        label = yolo_model.names[cls_id]
-                        conf = round(float(box.conf[0]), 2)
-                        detections.append({"class": label, "confidence": conf})
-                    
-                    latest_yolo_detections = detections
-                except Exception:
-                    annotated_frame = frame
-            else:
-                annotated_frame = frame
+    # Target Detection Presence
+    if any(d.get("class") == "person" for d in detections):
+        score += 10
+    if any(d.get("class") == "hazard" for d in detections):
+        score += 15
 
-            ret, buffer = cv2.imencode('.jpg', annotated_frame)
-            if ret:
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-            time.sleep(0.03)
-        else:
-            # Re-attempt connection if stream drops
-            cap.release()
-            time.sleep(1.0)
-            cap = cv2.VideoCapture(WEBCAM_STREAM_URL, cv2.CAP_FFMPEG)
-
-# Frame Generator for Thermal Stream
-def generate_thermal_stream():
-    cap = cv2.VideoCapture(THERMAL_STREAM_URL)
-    while True:
-        success, frame = cap.read()
-        if success and frame is not None:
-            ret, buffer = cv2.imencode('.jpg', frame)
-            if ret:
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-                time.sleep(0.05)
-                continue
-        
-        cap.release()
-        time.sleep(0.5)
-        cap = cv2.VideoCapture(THERMAL_STREAM_URL)
-
-        # Tactical Thermal Standby Frame
-        blank = np.zeros((480, 640, 3), dtype=np.uint8)
-        cv2.rectangle(blank, (15, 15), (625, 465), (30, 40, 60), 1)
-        cv2.line(blank, (320, 200), (320, 280), (0, 165, 255), 1)
-        cv2.line(blank, (280, 240), (360, 240), (0, 165, 255), 1)
-        cv2.circle(blank, (320, 240), 30, (0, 165, 255), 1)
-        
-        cv2.putText(blank, "THERMAL CAMERA STANDBY", (190, 220),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 165, 255), 2, cv2.LINE_AA)
-        cv2.putText(blank, "MLX90640 THERMAL SENSOR OFFLINE", (170, 275),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 120), 1, cv2.LINE_AA)
-
-        ret, buffer = cv2.imencode('.jpg', blank)
-        if ret:
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-        time.sleep(0.5)
-
-# API Routes
-@app.route("/")
-def index():
-    return send_from_directory("static", "index.html")
-
-@app.route("/api/telemetry", methods=["POST"])
-def receive_telemetry():
-    global latest_telemetry
-    data = request.get_json(silent=True)
-    if data:
-        latest_telemetry.update(data)
-        return jsonify({"status": "success"}), 200
-    return jsonify({"error": "invalid json"}), 400
-
-@app.route("/api/control", methods=["POST"])
-def send_control():
-    global pending_rover_command
-    data = request.get_json(silent=True)
-    if data and "command" in data:
-        pending_rover_command = data["command"]
-        return jsonify({"status": "queued"}), 200
-    return jsonify({"error": "invalid command"}), 400
-
-@app.route("/api/get-command", methods=["GET"])
-def get_command():
-    global pending_rover_command
-    cmd = pending_rover_command
-    pending_rover_command = None
-    return jsonify({"command": cmd})
-
-@app.route("/api/status")
-def status():
-    methane = latest_telemetry.get("methane", 0)
-    co = latest_telemetry.get("co", 0)
-    
-    score = 10
-    if methane > 30: score += 40
-    if co > 25: score += 35
-    if any(d["class"] == "person" for d in latest_yolo_detections): score += 15
     score = min(score, 100)
 
-    hazard_class = "CRITICAL HAZARD" if score >= 70 else ("ELEVATED RISK" if score >= 40 else "SAFE")
+    if score >= 70:
+        hazard_class = "CRITICAL HAZARD"
+        hazard_color = "#ef4444"
+    elif score >= 40:
+        hazard_class = "ELEVATED RISK"
+        hazard_color = "#f59e0b"
+    else:
+        hazard_class = "SAFE OPERATIONAL"
+        hazard_color = "#10b981"
 
+    return {
+        "score": score,
+        "class": hazard_class,
+        "color": hazard_color
+    }
+
+def get_full_system_status():
+    t_data = telemetry.get_telemetry()
+    detections = cameras.latest_detections
+    thermal = cameras.thermal_stats
+    motors = motor.get_status()
+    hazard = calculate_hazard_assessment(t_data, detections, thermal)
+
+    return {
+        "telemetry": t_data,
+        "yolo_detections": detections,
+        "thermal_stats": thermal,
+        "motors": motors,
+        "hazard": hazard,
+        "timestamp": time.time()
+    }
+
+# Background Telemetry Pusher (150ms interval)
+def telemetry_broadcast_loop():
+    while True:
+        try:
+            status = get_full_system_status()
+            # Emit full state payload
+            socketio.emit('telemetry_data', status)
+        except Exception as e:
+            pass
+        time.sleep(0.15)
+
+# --- Web Routes ---
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/video_feed')
+@app.route('/api/rgb-feed')
+def video_feed():
+    return Response(cameras.generate_webcam_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/thermal_feed')
+@app.route('/api/thermal-feed')
+def thermal_feed():
+    return Response(cameras.generate_thermal_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/telemetry')
+@app.route('/api/telemetry')
+def get_telemetry_endpoint():
+    return jsonify(telemetry.get_telemetry())
+
+@app.route('/api/status')
+def get_status_endpoint():
+    return jsonify(get_full_system_status())
+
+@app.route('/control', methods=['POST'])
+@app.route('/api/control', methods=['POST'])
+def handle_control_post():
+    data = request.get_json(silent=True) or {}
+    if 'command' in data:
+        motor.command(data['command'], speed=data.get('speed', 75))
+    elif 'x' in data or 'y' in data:
+        x = float(data.get('x', 0))
+        y = float(data.get('y', 0))
+        motor.drive(x, y)
+    return jsonify({"status": "ok", "motor_state": motor.get_status()})
+
+@app.route('/stop', methods=['POST'])
+@app.route('/api/stop', methods=['POST'])
+def handle_stop_post():
+    motor.command("ESTOP")
+    return jsonify({"status": "emergency_stop_applied", "motor_state": motor.get_status()})
+
+@app.route('/api/ports', methods=['GET'])
+def get_ports_endpoint():
     return jsonify({
-        "telemetry": latest_telemetry,
-        "yolo_detections": latest_yolo_detections,
-        "hazard": {"score": score, "class": hazard_class}
+        "available_ports": get_available_ports(),
+        "active_port": telemetry.port,
+        "port_status": telemetry.data.get("port_status", "UNKNOWN"),
+        "status_message": telemetry.data.get("status_message", "")
     })
 
-@app.route("/api/rgb-feed")
-def rgb_feed():
-    return Response(generate_optical_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+@app.route('/api/select-port', methods=['POST'])
+def select_port_endpoint():
+    data = request.get_json(silent=True) or {}
+    new_port = data.get('port', 'AUTO')
+    telemetry.set_port(new_port)
+    return jsonify({
+        "status": "success",
+        "active_port": telemetry.port
+    })
 
-@app.route("/api/thermal-feed")
-def thermal_feed():
-    return Response(generate_thermal_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+@app.route('/api/colormap', methods=['POST'])
+def set_colormap_endpoint():
+    data = request.get_json(silent=True) or {}
+    mode = data.get('mode', 'INFERNO')
+    cameras.set_colormap(mode)
+    return jsonify({"status": "success", "mode": cameras.colormap_mode})
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
+# --- WebSocket Events ---
+@socketio.on('connect')
+def handle_connect():
+    emit('telemetry_data', get_full_system_status())
+
+@socketio.on('drive_cmd')
+def handle_drive_ws(data):
+    x = float(data.get('x', 0))
+    y = float(data.get('y', 0))
+    motor.drive(x, y)
+
+@socketio.on('command')
+def handle_command_ws(data):
+    cmd = data.get('cmd', 'STOP')
+    spd = data.get('speed', 75)
+    motor.command(cmd, spd)
+
+@socketio.on('e_stop')
+def handle_estop_ws():
+    motor.command("ESTOP")
+
+if __name__ == '__main__':
+    # Start background telemetry pusher thread
+    t = threading.Thread(target=telemetry_broadcast_loop)
+    t.daemon = True
+    t.start()
+
+    print("[SYSTEM] Command Centre Web Interface initialized.")
+    print("[SYSTEM] Access dashboard at: http://localhost:5000")
+    try:
+        socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
+    finally:
+        motor.cleanup()
