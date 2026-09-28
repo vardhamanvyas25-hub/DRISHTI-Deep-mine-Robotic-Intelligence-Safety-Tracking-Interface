@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DRISHTI 6WD Rover Command Centre</title>
+
+    <!-- Google Fonts & CDN Libraries -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+
+    <!-- Stylesheet -->
+    <link rel="stylesheet" href="/static/css/style.css">
+
+    <!-- External Client Libraries (CDN with Fallback Handling) -->
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/nipplejs@0.10.2/dist/nipplejs.min.js"></script>
+</head>
+<body>
+    <!-- Top Command Navigation Bar -->
+    <header class="navbar">
+        <div class="brand-section">
+            <div class="brand-badge">DRISHTI</div>
+            <div class="brand-text">
+                <h1>6WD ROVER COMMAND CENTRE</h1>
+                <p>AUTONOMOUS MINE RESCUE & EXPLORATION STATION</p>
+            </div>
+        </div>
+
+        <div class="system-status-bar">
+            <!-- Hardware / Port Link Status -->
+            <div class="status-pill" id="port-pill">
+                <span class="status-indicator-dot" id="link-dot"></span>
+                <span id="link-status-text">INITIALIZING LINK...</span>
+            </div>
+
+            <!-- Serial Port Selector -->
+            <div class="port-selector-box">
+                <label for="com-port-select">PORT:</label>
+                <select id="com-port-select">
+                    <option value="AUTO">AUTO (Scanning)</option>
+                    <option value="COM3" selected>COM3</option>
+                </select>
+                <button id="btn-refresh-ports" title="Scan and reconnect COM ports">↻</button>
+            </div>
+
+            <!-- Battery Level Indicator -->
+            <div class="battery-meter-box">
+                <div class="battery-shell">
+                    <div class="battery-fill" id="bat-fill" style="width: 85%;"></div>
+                </div>
+                <div class="battery-labels">
+                    <span id="bat-pct-text">85%</span>
+                    <small id="bat-volt-text">12.2V</small>
+                </div>
+            </div>
+
+            <!-- Emergency Stop Button -->
+            <button class="estop-header-btn" id="estop-btn">
+                🛑 E-STOP
+            </button>
+        </div>
+    </header>
+
+    <!-- Hardware Busy Alert Banner (Shown when Arduino IDE or another app locks COM3) -->
+    <div id="hw-alert-banner" class="alert-banner" style="display: none;">
+        <span class="alert-icon">⚠️</span>
+        <span id="hw-alert-text">COM3 is currently in use by Arduino IDE Serial Monitor. Close Serial Monitor in Arduino IDE to link real ESP32-S3 hardware. Live simulation is running.</span>
+    </div>
+
+    <!-- Main Command Dashboard Grid -->
+    <main class="dashboard-grid">
+
+        <!-- LEFT COLUMN: Dual Camera Feeds -->
+        <section class="feeds-column">
+            <!-- Optical Camera Feed (RGB + YOLOv8) -->
+            <div class="panel-card stream-card">
+                <div class="panel-header">
+                    <div class="header-left">
+                        <span class="panel-tag tag-cyan">OPTICAL RECON</span>
+                        <h3>WEBCAM & YOLOv8 TARGET DETECTION</h3>
+                    </div>
+                    <div class="stream-stats">
+                        <span class="badge badge-subtle" id="yolo-count-badge">DETECTIONS: 0</span>
+                        <button class="icon-btn" onclick="toggleFullscreen('rgb-feed')" title="Fullscreen">⛶</button>
+                    </div>
+                </div>
+                <div class="stream-viewport">
+                    <img id="rgb-feed" src="/video_feed" alt="RGB Optical Recon with YOLO Human & Object Detection">
+                    <div class="viewport-hud-overlay">
+                        <span class="hud-crosshair"></span>
+                        <div class="hud-top-left">CAM 01 // 640x480 RGB</div>
+                        <div class="hud-bottom-right" id="cam1-fps">30 FPS</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Thermal Camera Feed (MLX90640) -->
+            <div class="panel-card stream-card">
+                <div class="panel-header">
+                    <div class="header-left">
+                        <span class="panel-tag tag-orange">THERMAL SPECTRUM</span>
+                        <h3>MLX90640 THERMAL CAMERA (32×24)</h3>
+                    </div>
+                    <div class="stream-stats">
+                        <span class="badge badge-orange" id="thermal-hotspot-tag">HOTSPOT: NORMAL</span>
+                        <div class="colormap-toggle">
+                            <button id="btn-inferno" class="cmap-btn active" onclick="setColormap('INFERNO')">INFERNO</button>
+                            <button id="btn-jet" class="cmap-btn" onclick="setColormap('JET')">JET</button>
+                        </div>
+                        <button class="icon-btn" onclick="toggleFullscreen('thermal-feed')" title="Fullscreen">⛶</button>
+                    </div>
+                </div>
+                <div class="stream-viewport">
+                    <img id="thermal-feed" src="http://192.168.50.2:5000//thermal_feed" alt="MLX90640 Thermal Stream">
+                    <div class="viewport-hud-overlay">
+                        <div class="hud-top-left">MLX90640 // BICUBIC INTERPOLATION</div>
+                        <div class="hud-bottom-left" id="thermal-spot-hud">MAX: --°C | AVG: --°C</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- RIGHT COLUMN: Tactical Analytics & Telemetry -->
+        <section class="analytics-column">
+
+            <!-- Top Row: Hazard Score + YOLO Detections -->
+            <div class="hazard-detections-row">
+                <!-- Multi-Sensor Hazard Gauge -->
+                <div class="panel-card hazard-card">
+                    <div class="panel-header">
+                        <span class="panel-tag tag-green">AI RISK RATING</span>
+                        <h3>HAZARD MATRIX</h3>
+                    </div>
+                    <div class="hazard-display">
+                        <div class="hazard-score-circle">
+                            <span class="score-number" id="hazard-score">12</span>
+                            <span class="score-max">/100</span>
+                        </div>
+                        <div class="hazard-status-box">
+                            <h4 id="hazard-class-text">SAFE OPERATIONAL</h4>
+                            <p id="hazard-sub-text">All sensor parameters within baseline safety limits.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- YOLO Target Detections List -->
+                <div class="panel-card detections-card">
+                    <div class="panel-header">
+                        <span class="panel-tag tag-cyan">TARGET INTEL</span>
+                        <h3>ACTIVE DETECTIONS</h3>
+                    </div>
+                    <div class="detections-container" id="detections-list">
+                        <div class="empty-detections">No hazards or survivors detected in FOV.</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Real-Time Atmospheric Gas Chart -->
+            <div class="panel-card chart-card">
+                <div class="panel-header">
+                    <div class="header-left">
+                        <span class="panel-tag tag-orange">ATMOSPHERIC MONITOR</span>
+                        <h3>REAL-TIME GAS CONCENTRATION (MQ-4 & MQ-7)</h3>
+                    </div>
+                    <div class="chart-legend-box">
+                        <span class="legend-item"><span class="legend-color dot-mq4"></span> MQ-4 Methane</span>
+                        <span class="legend-item"><span class="legend-color dot-mq7"></span> MQ-7 Carbon Monoxide</span>
+                    </div>
+                </div>
+                <div class="chart-wrapper">
+                    <canvas id="gasChart"></canvas>
+                </div>
+            </div>
+
+            <!-- ESP32 Sensor Inputs Grid (Direct Mapping from esp32_ino_copy_20260927130219.ino) -->
+            <div class="panel-card telemetry-card">
+                <div class="panel-header">
+                    <div class="header-left">
+                        <span class="panel-tag tag-cyan">ESP32-S3 TELEMETRY</span>
+                        <h3>HARDWARE SENSOR READINGS</h3>
+                    </div>
+                    <div class="telemetry-meta">
+                        <span class="meta-item">PKTS: <strong id="val-packets">0</strong></span>
+                        <span class="meta-item">AGE: <strong id="val-age">0.0s</strong></span>
+                    </div>
+                </div>
+
+                <div class="sensor-cards-grid">
+                    <!-- Sensor 1: MQ-4 Methane -->
+                    <div class="sensor-tile" id="tile-mq4">
+                        <div class="tile-header">
+                            <span class="tile-name">MQ-4 METHANE</span>
+                            <span class="tile-badge badge-green" id="badge-mq4">NORMAL</span>
+                        </div>
+                        <div class="tile-value-row">
+                            <span class="tile-value" id="val-mq4">--</span>
+                            <span class="tile-unit">ADC Raw</span>
+                        </div>
+                        <div class="tile-bar-bg">
+                            <div class="tile-bar-fill fill-mq4" id="bar-mq4" style="width: 15%;"></div>
+                        </div>
+                    </div>
+
+                    <!-- Sensor 2: MQ-7 Carbon Monoxide -->
+                    <div class="sensor-tile" id="tile-mq7">
+                        <div class="tile-header">
+                            <span class="tile-name">MQ-7 CARBON MONOXIDE</span>
+                            <span class="tile-badge badge-green" id="badge-mq7">NORMAL</span>
+                        </div>
+                        <div class="tile-value-row">
+                            <span class="tile-value" id="val-mq7">--</span>
+                            <span class="tile-unit">ADC Raw</span>
+                        </div>
+                        <div class="tile-bar-bg">
+                            <div class="tile-bar-fill fill-mq7" id="bar-mq7" style="width: 12%;"></div>
+                        </div>
+                    </div>
+
+                    <!-- Sensor 3: DHT11 Temp & Humidity -->
+                    <div class="sensor-tile">
+                        <div class="tile-header">
+                            <span class="tile-name">DHT11 ENVIRONMENT</span>
+                            <span class="tile-badge badge-cyan">CLIMATE</span>
+                        </div>
+                        <div class="tile-split-values">
+                            <div>
+                                <span class="tile-value" id="val-temp">--</span>
+                                <span class="tile-unit">°C Temp</span>
+                            </div>
+                            <div class="val-divider"></div>
+                            <div>
+                                <span class="tile-value" id="val-humidity">--</span>
+                                <span class="tile-unit">% Hum</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Sensor 4: BMP280 Barometer -->
+                    <div class="sensor-tile">
+                        <div class="tile-header">
+                            <span class="tile-name">BMP280 BAROMETER</span>
+                            <span class="tile-badge badge-yellow">PRESSURE</span>
+                        </div>
+                        <div class="tile-value-row">
+                            <span class="tile-value" id="val-pressure">--</span>
+                            <span class="tile-unit">hPa</span>
+                        </div>
+                        <div class="tile-subtext">Estimated Alt: <strong id="val-altitude">-- m</strong></div>
+                    </div>
+
+                    <!-- Sensor 5: LiPo Battery Monitor -->
+                    <div class="sensor-tile">
+                        <div class="tile-header">
+                            <span class="tile-name">BATTERY VOLTAGE</span>
+                            <span class="tile-badge badge-green" id="badge-battery">3S LIPO</span>
+                        </div>
+                        <div class="tile-value-row">
+                            <span class="tile-value" id="val-battery-volts">--</span>
+                            <span class="tile-unit">V</span>
+                        </div>
+                        <div class="tile-subtext">State of Charge: <strong id="val-battery-sub">--%</strong></div>
+                    </div>
+
+                    <!-- Sensor 6: Rover State -->
+                    <div class="sensor-tile">
+                        <div class="tile-header">
+                            <span class="tile-name">ROVER STATE</span>
+                            <span class="tile-badge badge-cyan">STATUS</span>
+                        </div>
+                        <div class="tile-value-row">
+                            <span class="tile-value state-highlight" id="val-rover-state">READY</span>
+                        </div>
+                        <div class="tile-subtext">Motor Driver: <strong id="val-motor-state">IDLE</strong></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ROVER NAVIGATION & DRIVE CONTROL CENTER -->
+            <div class="panel-card controls-card">
+                <div class="panel-header">
+                    <div class="header-left">
+                        <span class="panel-tag tag-orange">GROUND PROPULSION</span>
+                        <h3>BTS7960 DUAL MOTOR DRIVE CONTROL</h3>
+                    </div>
+                    <div class="drive-telemetry-pill">
+                        LEFT: <span id="drive-left-pct">0%</span> | RIGHT: <span id="drive-right-pct">0%</span>
+                    </div>
+                </div>
+
+                <div class="control-station-grid">
+                    <!-- Virtual Joystick Zone -->
+                    <div class="joystick-column">
+                        <div id="joystick-zone"></div>
+                        <span class="control-label">PROPORTIONAL JOYSTICK (DRAG / TOUCH)</span>
+                    </div>
+
+                    <!-- D-Pad Buttons -->
+                    <div class="dpad-column">
+                        <div class="dpad-wrapper">
+                            <div></div>
+                            <button class="dpad-btn" id="btn-up" onclick="sendDirectionCmd('FORWARD')">▲</button>
+                            <div></div>
+
+                            <button class="dpad-btn" id="btn-left" onclick="sendDirectionCmd('LEFT')">◀</button>
+                            <button class="dpad-btn btn-brake" id="btn-stop-center" onclick="sendDirectionCmd('STOP')">STOP</button>
+                            <button class="dpad-btn" id="btn-right" onclick="sendDirectionCmd('RIGHT')">▶</button>
+
+                            <div></div>
+                            <button class="dpad-btn" id="btn-down" onclick="sendDirectionCmd('BACKWARD')">▼</button>
+                            <div></div>
+                        </div>
+                    </div>
+
+                    <!-- Keyboard Hotkeys Indicator -->
+                    <div class="keyboard-column">
+                        <div class="keyboard-legend-title">KEYBOARD DRIVE HOTKEYS</div>
+                        <div class="key-indicator-row">
+                            <div class="key-box" id="key-w">W</div>
+                            <span class="key-desc">FORWARD (Throttle Up)</span>
+                        </div>
+                        <div class="key-indicator-row">
+                            <div class="key-box" id="key-a">A</div>
+                            <span class="key-desc">STEER LEFT</span>
+                        </div>
+                        <div class="key-indicator-row">
+                            <div class="key-box" id="key-s">S</div>
+                            <span class="key-desc">REVERSE (Throttle Down)</span>
+                        </div>
+                        <div class="key-indicator-row">
+                            <div class="key-box" id="key-d">D</div>
+                            <span class="key-desc">STEER RIGHT</span>
+                        </div>
+                        <div class="key-indicator-row">
+                            <div class="key-box key-space" id="key-space">SPACE</div>
+                            <span class="key-desc">BRAKE / STOP</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </section>
+    </main>
+
+    <!-- Dashboard Main Script -->
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
